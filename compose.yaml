@@ -1,0 +1,153 @@
+# The whole product, as containers.
+#
+# Distinct from event-ticket-backend/compose.yaml, which starts the two things a developer
+# needs behind a locally-run application and nothing else. This one starts the application
+# too, and is therefore the first place the deployed shape of the system exists: one origin in
+# front of both halves, an object store the browser and the backend reach by different
+# addresses, and not a single credential with a default.
+#
+# Images by tag rather than by build context, so this file is the same whether the images came
+# from ./build.sh on a laptop or from a registry. build.sh is where the assumption about where
+# the source lives is kept, and it is one variable.
+
+name: event-ticket
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: ${DATABASE_NAME}
+      POSTGRES_USER: ${DATABASE_USERNAME}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+      # Pinned rather than left to the image. Postgres 18 moved the default data directory
+      # and declares VOLUME /var/lib/postgresql, so a compose file written for 17 keeps
+      # working and quietly stops persisting - the named volume mounts somewhere the server
+      # never writes and the real cluster lands in an anonymous one.
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # No published port. Nothing outside this network has any business reaching the database,
+    # and leaving 5432 open is also what would collide with the development stack.
+    healthcheck:
+      # -d as well as -U: pg_isready answers "accepting connections" for a server with no such
+      # role and no such database.
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USERNAME} -d ${DATABASE_NAME}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${STORAGE_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${STORAGE_SECRET_KEY}
+    ports:
+      # Published, unlike the database, because this one genuinely faces the browser: a cover
+      # is posted straight here from a form and fetched straight from here on a public page.
+      - "${STORAGE_PORT}:9000"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Creates the bucket and makes its objects - and only its objects - readable, then exits.
+  #
+  # Not `mc anonymous set download`, which is the obvious command and grants ListBucket along
+  # with GetObject. The keys carry organization and event ids, so a listable bucket publishes
+  # which organizations exist and how many events each has, drafts included.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY}
+      STORAGE_BUCKET: ${STORAGE_BUCKET}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 "$$STORAGE_ACCESS_KEY" "$$STORAGE_SECRET_KEY"
+        mc mb --ignore-existing "local/$$STORAGE_BUCKET"
+        cat > /tmp/public-read.json <<JSON
+        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::$$STORAGE_BUCKET/*"]}]}
+        JSON
+        mc anonymous set-json /tmp/public-read.json "local/$$STORAGE_BUCKET"
+        mc ilm rule add --expire-days 1 --prefix pending/ "local/$$STORAGE_BUCKET" || true
+
+  backend:
+    image: ${BACKEND_IMAGE}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: jdbc:postgresql://postgres:5432/${DATABASE_NAME}
+      DATABASE_USERNAME: ${DATABASE_USERNAME}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+
+      # Every link this system emails is built from this - address verification, a ticket, a
+      # refund notice - so it has to be where a person's browser reaches the application, not
+      # where the container thinks it is.
+      APP_BASE_URL: http://localhost:${APP_PORT}
+
+      JWT_SECRET: ${JWT_SECRET}
+      TICKET_CODE_KEY: ${TICKET_CODE_KEY}
+      FAKE_PAYMENT_SECRET: ${FAKE_PAYMENT_SECRET}
+      PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS}
+
+      # The three storage addresses, and the reason there are three. `minio` is a name only
+      # this network resolves, so it is right for the SDK and wrong for anything a browser is
+      # handed; the other two are the published port, and stay separate because a CDN could
+      # serve a cover without being able to accept one.
+      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_UPLOAD_BASE_URL: http://localhost:${STORAGE_PORT}
+      STORAGE_PUBLIC_BASE_URL: http://localhost:${STORAGE_PORT}/${STORAGE_BUCKET}
+      STORAGE_BUCKET: ${STORAGE_BUCKET}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY}
+      STORAGE_REGION: ${STORAGE_REGION}
+
+      # Absent means there is no Stripe provider at all, rather than one that fails on first
+      # use. Empty is the correct value for a deployment without an account.
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+    # Not published. The browser reaches the API through the frontend's proxy on one origin,
+    # which is the arrangement the client assumes - it asks for /api/v1 relative to wherever
+    # it was served and never learns a backend address.
+    healthcheck:
+      # The health endpoint rather than the port, because `depends_on: service_healthy` is
+      # only worth anything if it waits for Flyway and the context, not for a socket. The path
+      # carries the context path, which is where the contract's /api/v1 comes from.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/v1/actuator/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  frontend:
+    image: ${FRONTEND_IMAGE}
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BACKEND_ORIGIN: http://backend:8080
+    ports:
+      - "${APP_PORT}:80"
+    healthcheck:
+      # By address, not by name. `localhost` is ::1 in here, and a check aimed at an interface
+      # the server is not listening on stays red for ever while the site works perfectly.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+  miniodata:
