@@ -1,17 +1,50 @@
 # event-ticket-deploy
 
-Runs the whole product as containers: Postgres, SeaweedFS, the backend and the frontend behind one
-origin.
+Runs the product behind one origin: the backend and the frontend as containers, SeaweedFS beside
+them, and **the database on the host**.
 
 ```bash
 git clone https://github.com/event-ticket-org/event-ticket-backend.git
 git clone https://github.com/event-ticket-org/event-ticket-frontend.git
 git clone https://github.com/event-ticket-org/event-ticket-deploy.git
 cd event-ticket-deploy
-./build.sh          # builds both images, and writes .env with generated secrets
+./build.sh                        # builds both images, and writes .env with generated secrets
+sudo host/install-postgres.sh     # the database cluster, under systemd
 docker compose up -d
 open http://localhost:8081
 ```
+
+## Where each thing runs, and why
+
+| | Where | |
+|---|---|---|
+| backend, frontend | **containers** | stateless. The image tag is the version; if an image is lost you rebuild it from source. |
+| PostgreSQL | **host**, systemd, its own cluster | state you cannot rebuild |
+| SeaweedFS | container, for now | state you cannot rebuild either — it should follow |
+
+The line is not "containers bad". It is **which things hold state that cannot be reconstructed**.
+A backend container is disposable by definition. A database volume is not.
+
+That distinction was not theoretical here. MinIO archived its community edition and withdrew its
+Docker Hub repository, and every `minio/minio` tag became unpullable at once — the pinned release
+included. The running container survived only because the image happened to still be on the disk.
+A stateful service whose runtime can be withdrawn by a third party is a stateful service one
+`docker image prune` away from being gone.
+
+The host database also gets what the packaging already does well: `pg_upgradecluster` for major
+versions, apt security updates, systemd ordering that starts it before Docker, and
+`pg_createcluster` for running several clusters side by side — which is how the standbys are
+meant to be run, and closer to production than three containers would be.
+
+`host/` carries the provisioning: `install-postgres.sh` creates the cluster,
+`migrate-container-to-host.sh` moves an existing containerised database into it, and
+`prepare-replication.sh` makes it replicable. All three are idempotent.
+
+**Three things must agree before a container can reach the host database**: `listen_addresses`,
+`pg_hba.conf`, and the host firewall. The firewall is the one that fails silently — `ufw` governs
+the INPUT chain where container-to-host traffic lands, Docker's `DOCKER-USER` bypass does not
+apply, and it **drops** rather than refuses. The symptom is a connection timeout that reads
+exactly like the database being down. `install-postgres.sh` sets all three.
 
 `build.sh` expects the other two repositories beside this one. Override with `BACKEND_REPO` and
 `FRONTEND_REPO`, or skip it entirely and set `BACKEND_IMAGE` / `FRONTEND_IMAGE` in `.env` to
@@ -20,33 +53,38 @@ images from a registry — `compose.yaml` only ever refers to tags.
 ## Read replicas, optional
 
 ```bash
-docker compose -f compose.yaml -f compose.replicated.yaml up -d
+sudo host/prepare-replication.sh
 ```
 
-Two streaming standbys, and the application routing read-only transactions to one of them. The
-base stack is unchanged and still single-node; this is an overlay over the same primary, not a
-second cluster, so there is nothing to migrate between the two shapes.
+Standbys are **further clusters on this host**, not containers — `pg_createcluster` plus
+`pg_basebackup`, each its own systemd unit and port. That is what Debian's packaging is for, and
+it keeps the standbys in the same place as the primary rather than splitting one cluster across
+two runtimes.
 
-It needs `REPLICATION_PASSWORD` in `.env`, and nothing else. `primary-init` prepares the primary
-on every `up` and is idempotent: it creates the `replicator` role, adds the one `pg_hba` rule the
-image omits for anything but loopback, and bounds `max_slot_wal_keep_size`. **The primary is
-never restarted** — PostgreSQL 18 enables data checksums at initdb, which gives `pg_rewind` what
-`wal_log_hints` would have, and every other setting is adequate by default.
+`prepare-replication.sh` gets the primary ready without restarting it: the `replicator` role, the
+`pg_hba` rule, and a bound on `max_slot_wal_keep_size`. It never needs `wal_log_hints`, because
+`install-postgres.sh` creates the cluster with `--data-checksums` and checksums give `pg_rewind`
+the same guarantee.
 
-**On one machine this does not buy availability.** Three containers here share a disk, a kernel
-and a power supply. Postgres also promotes nothing by itself, which was measured rather than
-assumed: kill the primary and both standbys sit there reporting healthy and serving reads until
-a human runs `pg_promote()`. What it buys is read capacity, a backup target off the node serving
-traffic, and somewhere to rehearse a failover before performing one for real.
+`max_slot_wal_keep_size` defaults to unlimited, which is the dangerous direction: a standby that
+stops consuming pins WAL until the disk fills, and a full disk stops the **primary**. Bounding it
+inverts that — a standby down too long loses its slot and is rebuilt from a basebackup. That is
+the failure worth having.
 
-Replication is **asynchronous**, deliberately. Synchronous commit with no standby left freezes
-every write on the primary indefinitely while `pg_isready` still answers healthy — the worst of
-the failures catalogued in event-ticket-backend's `docs/replication/01-what-went-wrong.md`, and
-not one to hand a live site by default.
+Replication is **asynchronous**. `synchronous_standby_names` with no standby left freezes every
+write on the primary indefinitely while `pg_isready` still answers healthy. When it is wanted the
+shape is `ANY 1 (standby1, standby2)`: quorum commit runs at the speed of the fastest standby,
+where naming a single one ties every commit to that node forever.
+
+**On one machine this does not buy availability.** Clusters here share a disk, a kernel and a
+power supply, and Postgres promotes nothing by itself — measured, not assumed: kill the primary
+and the standbys sit there reporting healthy and serving reads until a human runs `pg_promote()`.
+What it buys is read capacity, a backup target off the node serving traffic, and somewhere to
+rehearse a failover before performing one for real.
 
 `APP_DATASOURCE_REPLICA_URL` is what turns routing on in the application. Absent — which is the
-base stack, a fresh clone and the whole test suite — no routing datasource is declared at all and
-the application behaves exactly as it did before replicas existed.
+default — no routing datasource is declared at all and the application behaves exactly as it did
+before replicas existed.
 
 ## What this is not
 
@@ -114,6 +152,12 @@ PG_CONTAINER=event-ticket-postgres-1 \
 FAKE_PAYMENT_SECRET=$(grep '^FAKE_PAYMENT_SECRET=' .env | cut -d= -f2) \
   ../event-ticket-backend/scripts/confirm-payment.sh <order-id>
 ```
+
+**These two scripts do not work against a host database yet.** They reach Postgres with
+`docker exec "$PG_CONTAINER" psql`, which needs a container that no longer exists here. Teaching
+them to take a connection string instead is a change in event-ticket-backend, not this
+repository. Until then, run them against the development stack, where the database is still a
+container.
 
 ## The first administrator
 
