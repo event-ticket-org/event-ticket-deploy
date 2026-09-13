@@ -1,6 +1,6 @@
 # event-ticket-deploy
 
-Runs the whole product as containers: Postgres, MinIO, the backend and the frontend behind one
+Runs the whole product as containers: Postgres, SeaweedFS, the backend and the frontend behind one
 origin.
 
 ```bash
@@ -44,7 +44,7 @@ it the moment the backend runs in a container:
 
 | | who uses it | why it is separate |
 |---|---|---|
-| `STORAGE_ENDPOINT` | the backend's SDK | `minio:9000` — a name only the container network resolves |
+| `STORAGE_ENDPOINT` | the backend's SDK | `seaweedfs:9000` — a name only the container network resolves |
 | `STORAGE_UPLOAD_BASE_URL` | the browser, posting a cover | must be reachable from outside Docker |
 | `STORAGE_PUBLIC_BASE_URL` | the browser, fetching a cover | may be a CDN, which can serve a picture and cannot accept one |
 

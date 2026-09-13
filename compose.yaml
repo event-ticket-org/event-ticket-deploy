@@ -36,56 +36,80 @@ services:
       timeout: 3s
       retries: 10
 
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: server /data --console-address ":9001"
+  # Object storage for cover images (ADR-0006).
+  #
+  # SeaweedFS rather than MinIO: the MinIO community edition was archived in April 2026 and its
+  # Docker Hub repository withdrawn, so `minio/minio` cannot be pulled at any tag - the pinned
+  # release included. A deployment whose store cannot be recreated from its own compose file is
+  # one disk cleanup away from losing every cover permanently.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.46
+    # The identity file is written here rather than baked, because the credentials are this
+    # deployment's and arrive in the environment. SeaweedFS refuses every request until an
+    # identity exists, so a file that fails to appear yields a store that rejects the
+    # application - never one that lets the world write to it. That is the right direction to
+    # fail in, and it is why the store is configured this way rather than by a root password.
+    #
+    # `Read:${STORAGE_BUCKET}` on the anonymous identity is what serves a cover to a public
+    # page. Read is not List in SeaweedFS, so unlike `mc anonymous set download` there is no
+    # way for this to quietly grant ListBucket as well - which matters because the keys carry
+    # organization and event ids, so a listable bucket publishes which organizations exist and
+    # how many events each has, drafts included.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /etc/seaweedfs
+        cat > /etc/seaweedfs/s3.json <<JSON
+        {"identities":[
+          {"name":"app",
+           "credentials":[{"accessKey":"$$STORAGE_ACCESS_KEY","secretKey":"$$STORAGE_SECRET_KEY"}],
+           "actions":["Admin","Read","Write","List","Tagging"]},
+          {"name":"anonymous","actions":["Read:$$STORAGE_BUCKET"]}
+        ]}
+        JSON
+        exec weed server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json
     environment:
-      MINIO_ROOT_USER: ${STORAGE_ACCESS_KEY}
-      MINIO_ROOT_PASSWORD: ${STORAGE_SECRET_KEY}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY}
+      STORAGE_BUCKET: ${STORAGE_BUCKET}
     ports:
       # Published, unlike the database, because this one genuinely faces the browser: a cover
       # is posted straight here from a form and fetched straight from here on a public page.
       - "${STORAGE_PORT}:9000"
     volumes:
-      - miniodata:/data
+      - seaweeddata:/data
     healthcheck:
-      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      test: ["CMD-SHELL", "curl -fs http://localhost:9000/healthz || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
 
-  # Creates the bucket and makes its objects - and only its objects - readable, then exits.
-  #
-  # Not `mc anonymous set download`, which is the obvious command and grants ListBucket along
-  # with GetObject. The keys carry organization and event ids, so a listable bucket publishes
-  # which organizations exist and how many events each has, drafts included.
-  minio-init:
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+  # Creates the bucket and expires abandoned uploads, then exits. Public read is not its job -
+  # the identity file above grants that, so there is no policy to set and nothing to get wrong.
+  seaweedfs-init:
+    image: chrislusf/seaweedfs:4.46
     depends_on:
-      minio:
+      seaweedfs:
         condition: service_healthy
     environment:
-      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY}
-      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY}
       STORAGE_BUCKET: ${STORAGE_BUCKET}
+    # `weed shell` speaks to the master rather than the S3 API, which is why this needs the
+    # image and not an S3 client.
     entrypoint:
       - /bin/sh
       - -c
       - |
-        mc alias set local http://minio:9000 "$$STORAGE_ACCESS_KEY" "$$STORAGE_SECRET_KEY"
-        mc mb --ignore-existing "local/$$STORAGE_BUCKET"
-        cat > /tmp/public-read.json <<JSON
-        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::$$STORAGE_BUCKET/*"]}]}
-        JSON
-        mc anonymous set-json /tmp/public-read.json "local/$$STORAGE_BUCKET"
-        mc ilm rule add --expire-days 1 --prefix pending/ "local/$$STORAGE_BUCKET" || true
+        echo "s3.bucket.create -name $$STORAGE_BUCKET" | weed shell -master=seaweedfs:9333
+        echo "fs.configure -locationPrefix=/buckets/$$STORAGE_BUCKET/pending/ -ttl=1d -apply" \
+          | weed shell -master=seaweedfs:9333
 
   backend:
     image: ${BACKEND_IMAGE}
     depends_on:
       postgres:
         condition: service_healthy
-      minio-init:
+      seaweedfs-init:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: jdbc:postgresql://postgres:5432/${DATABASE_NAME}
@@ -102,11 +126,11 @@ services:
       FAKE_PAYMENT_SECRET: ${FAKE_PAYMENT_SECRET}
       PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS}
 
-      # The three storage addresses, and the reason there are three. `minio` is a name only
+      # The three storage addresses, and the reason there are three. `seaweedfs` is a name only
       # this network resolves, so it is right for the SDK and wrong for anything a browser is
       # handed; the other two are the published port, and stay separate because a CDN could
       # serve a cover without being able to accept one.
-      STORAGE_ENDPOINT: http://minio:9000
+      STORAGE_ENDPOINT: http://seaweedfs:9000
       STORAGE_UPLOAD_BASE_URL: http://localhost:${STORAGE_PORT}
       STORAGE_PUBLIC_BASE_URL: http://localhost:${STORAGE_PORT}/${STORAGE_BUCKET}
       STORAGE_BUCKET: ${STORAGE_BUCKET}
@@ -150,4 +174,4 @@ services:
 
 volumes:
   pgdata:
-  miniodata:
+  seaweeddata:
