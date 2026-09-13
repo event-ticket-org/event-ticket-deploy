@@ -1,0 +1,40 @@
+# Read routing: send read-only transactions to a standby.
+#
+#   docker compose -f compose.yaml -f compose.replicated.yaml up -d
+#
+# The standbys are clusters on this host, not services here - host/create-standby.sh builds them.
+# All this overlay does is tell the application one of them exists, which is the whole of the
+# deployment-side change.
+#
+# ── Why this is an overlay and not a line in compose.yaml ─────────────────────
+#
+# Absence is the switch, and it has to be true absence. The application declares its routing
+# DataSource with @ConditionalOnProperty("app.datasource.replica.url"), and Spring treats a
+# property that is present-but-empty as present - so `APP_DATASOURCE_REPLICA_URL: ${VAR:-}` in
+# compose.yaml would turn the feature on with an empty URL for every deployment that never set
+# it, and the failure would be a connection pool that cannot start.
+#
+# With the variable genuinely absent, no routing DataSource is declared, Boot autoconfigures its
+# usual single one, and not one class in shared/persistence exists.
+#
+# ── What routing actually does ───────────────────────────────────────────────
+#
+#   not read-only                     -> primary
+#   read-only, you wrote recently     -> primary, until the standby has replayed your write
+#   read-only, no recent write by you -> standby
+#
+# The guard is each caller's own last write position, compared against what the standby has
+# replayed - so @Transactional(readOnly = true) is sufficient and safe on its own, and a new read
+# endpoint inherits the guarantee without its author knowing any of this is here. The alternative
+# was classifying eighteen read-only use cases by hand, which has to be re-made by every future
+# developer.
+#
+# standby2 is deliberately not in the read path. It is the clean target - somewhere to take a
+# backup without touching the node answering queries, and a node to promote in a rehearsal while
+# standby1 keeps serving. One replica also makes the LSN comparison deterministic: one position
+# to be ahead of, rather than a choice of two.
+
+services:
+  backend:
+    environment:
+      APP_DATASOURCE_REPLICA_URL: jdbc:postgresql://${DATABASE_HOST}:${REPLICA_PORT:-5434}/${DATABASE_NAME}
