@@ -55,6 +55,17 @@ services:
     # way for this to quietly grant ListBucket as well - which matters because the keys carry
     # organization and event ids, so a listable bucket publishes which organizations exist and
     # how many events each has, drafts included.
+    #
+    # `-volume.max` is a count and not a size, and the default of 8 is the reason this is
+    # written down. A volume holds 30GB; eight of them were exhausted here by 1.4MB of covers,
+    # because SeaweedFS spreads concurrent writes across new volumes rather than filling one.
+    # Then the `pending/` expiry below needs a volume of its own - data with a TTL cannot share
+    # with data without one - and there was no slot left for it.
+    #
+    # What that looked like was every cover upload answering 500 while every cover already
+    # stored kept serving perfectly: reads fine, writes dead, and nothing in the S3 error
+    # mentioning volumes. Raising the ceiling costs nothing, since volumes are created on
+    # demand rather than reserved.
     entrypoint:
       - /bin/sh
       - -c
@@ -68,7 +79,8 @@ services:
           {"name":"anonymous","actions":["Read:$$STORAGE_BUCKET"]}
         ]}
         JSON
-        exec weed server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json
+        exec weed server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json \
+          -volume.max=32
     environment:
       STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY}
       STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY}
