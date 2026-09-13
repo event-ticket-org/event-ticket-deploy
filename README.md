@@ -53,38 +53,47 @@ images from a registry — `compose.yaml` only ever refers to tags.
 ## Read replicas, optional
 
 ```bash
-sudo host/prepare-replication.sh
+sudo host/prepare-replication.sh          # the primary: role, pg_hba, WAL bound. No restart.
+sudo host/create-standby.sh standby1 5434
+sudo host/create-standby.sh standby2 5435
+docker compose -f compose.yaml -f compose.replicated.yaml up -d
 ```
 
 Standbys are **further clusters on this host**, not containers — `pg_createcluster` plus
-`pg_basebackup`, each its own systemd unit and port. That is what Debian's packaging is for, and
-it keeps the standbys in the same place as the primary rather than splitting one cluster across
-two runtimes.
+`pg_basebackup`, each with its own data directory, port, configuration tree and systemd unit.
+That is what Debian's packaging is for, and it keeps the standbys in the same place as the
+primary rather than splitting one cluster across two runtimes.
 
-`prepare-replication.sh` gets the primary ready without restarting it: the `replicator` role, the
-`pg_hba` rule, and a bound on `max_slot_wal_keep_size`. It never needs `wal_log_hints`, because
-`install-postgres.sh` creates the cluster with `--data-checksums` and checksums give `pg_rewind`
-the same guarantee.
+`create-standby.sh` is idempotent and refuses to touch a cluster that is not a standby. It
+creates the replication slot **before** the basebackup and with `immediately_reserve`: a slot
+made afterwards cannot protect the WAL that backup needs, and one without the flag reserves
+nothing until something first connects to it — protection in name only.
 
-`max_slot_wal_keep_size` defaults to unlimited, which is the dangerous direction: a standby that
-stops consuming pins WAL until the disk fills, and a full disk stops the **primary**. Bounding it
-inverts that — a standby down too long loses its slot and is rebuilt from a basebackup. That is
-the failure worth having.
+**A standby inherits none of the primary's access configuration.** `pg_createcluster` writes a
+fresh tree, `listen_addresses` and `pg_hba.conf` live in `/etc` on Debian, and `pg_basebackup`
+only copies the data directory. So each standby needs the same three things the primary needed —
+`listen_addresses`, a `pg_hba` rule, and a `ufw` rule — and the firewall is again the one that
+fails silently, because it drops rather than refuses and the symptom is a hang. The script does
+all three.
+
+`prepare-replication.sh` never needs `wal_log_hints`, because `install-postgres.sh` creates the
+cluster with `--data-checksums` and checksums give `pg_rewind` the same guarantee. It bounds
+`max_slot_wal_keep_size`, which defaults to unlimited — the dangerous direction, since a standby
+that stops consuming pins WAL until the disk fills and a full disk stops the **primary**.
+Bounding it inverts that: a standby down too long loses its slot and is rebuilt. That is the
+failure worth having.
 
 Replication is **asynchronous**. `synchronous_standby_names` with no standby left freezes every
 write on the primary indefinitely while `pg_isready` still answers healthy. When it is wanted the
-shape is `ANY 1 (standby1, standby2)`: quorum commit runs at the speed of the fastest standby,
-where naming a single one ties every commit to that node forever.
+shape is `ANY 1 (standby1, standby2)` — quorum commit runs at the speed of the fastest standby,
+where naming a single one ties every commit to that node forever. The standbys record
+`application_name`, which is what that setting matches on, never the slot name.
 
-**On one machine this does not buy availability.** Clusters here share a disk, a kernel and a
+**On one machine this does not buy availability.** The clusters share a disk, a kernel and a
 power supply, and Postgres promotes nothing by itself — measured, not assumed: kill the primary
 and the standbys sit there reporting healthy and serving reads until a human runs `pg_promote()`.
 What it buys is read capacity, a backup target off the node serving traffic, and somewhere to
 rehearse a failover before performing one for real.
-
-`APP_DATASOURCE_REPLICA_URL` is what turns routing on in the application. Absent — which is the
-default — no routing datasource is declared at all and the application behaves exactly as it did
-before replicas existed.
 
 ## What this is not
 
