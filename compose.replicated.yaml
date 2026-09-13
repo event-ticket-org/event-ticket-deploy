@@ -1,0 +1,133 @@
+# Two streaming standbys, and the application reading from one of them.
+#
+#   docker compose up -d                                          # single node, as before
+#   docker compose -f compose.yaml -f compose.replicated.yaml up -d
+#
+# An overlay rather than a second stack, because the primary is the same container either way -
+# the one already holding the live data. Nothing here reinitialises it and nothing here requires
+# it to restart: PostgreSQL 18 turns data checksums on at initdb, which gives pg_rewind what
+# wal_log_hints would have, and wal_level, max_wal_senders and max_replication_slots are all
+# adequate at their defaults. What the primary did need - a replicator role, a pg_hba rule, and
+# a bound on the WAL a dead standby can pin - is a catalogue change and a SIGHUP.
+#
+# ── What this buys, stated honestly ───────────────────────────────────────────
+#
+# On one machine, not availability. Three postgres containers here share a disk, a kernel and a
+# power supply, and every failure that takes the machine down takes all three. PostgreSQL also
+# promotes nothing by itself - that was measured, not assumed: kill the primary and both
+# standbys sit there reporting healthy and serving reads until a human runs pg_promote().
+#
+# What it does buy is read capacity, backups taken off the node serving traffic, and a place to
+# rehearse a failover before performing one for real.
+#
+# ── Asynchronous, deliberately ────────────────────────────────────────────────
+#
+# synchronous_standby_names stays empty. Turning synchronous replication on and then losing the
+# last standby freezes every write on the primary indefinitely, with pg_isready still answering
+# healthy - the most dangerous of the failures catalogued in event-ticket-backend's
+# docs/replication/01-what-went-wrong.md, and not one to introduce to a live site by default.
+#
+# When it is wanted, the shape is `ANY 1 (standby1, standby2)`, which was measured at 1.97ms
+# against 57.71ms for a single slow synchronous standby: quorum commit runs at the speed of the
+# fastest standby, where naming one ties every commit to that one node forever.
+
+services:
+  # Prepares the primary and exits. Idempotent, so it runs on every `up` against a primary that
+  # is usually already prepared and usually serving traffic.
+  #
+  # It mounts the primary's data directory because pg_hba.conf lives there and nothing else can
+  # reach it, and it connects over the network for everything else. Nothing it does restarts the
+  # primary.
+  primary-init:
+    image: postgres:18
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/primary-init.sh"]
+    environment:
+      PRIMARY_HOST: postgres
+      POSTGRES_USER: ${DATABASE_USERNAME}
+      POSTGRES_DB: ${DATABASE_NAME}
+      PGPASSWORD: ${DATABASE_PASSWORD}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD}
+      # Pinned to match the primary, and for the same reason compose.yaml pins it there:
+      # Postgres 18 moved its default data directory to /var/lib/postgresql/18/docker. Inherit
+      # that default here and this reads pg_hba.conf from a path the volume is not mounted at -
+      # which fails loudly, but only after the role has already been created.
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/replication/primary-init.sh:/usr/local/bin/primary-init.sh:ro
+
+  standby1:
+    image: postgres:18
+    depends_on:
+      primary-init:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/standby-entrypoint.sh"]
+    command: ["postgres"]
+    environment:
+      PRIMARY_HOST: postgres
+      REPLICATION_SLOT: standby1
+      PGPASSWORD: ${REPLICATION_PASSWORD}
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - standby1data:/var/lib/postgresql/data
+      - ./docker/replication/standby-entrypoint.sh:/usr/local/bin/standby-entrypoint.sh:ro
+    healthcheck:
+      # -d as well as -U, for the same reason the primary's healthcheck carries it: pg_isready
+      # answers "accepting connections" for a server with no such role and no such database.
+      #
+      # It still cannot tell you this standby is replicating, or how far behind it is. Nothing
+      # in a health check can - that is a query, and the application asks it every 200ms through
+      # ReplicaFreshness rather than trusting a green tick here.
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USERNAME} -d ${DATABASE_NAME}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # A second standby that serves nothing.
+  #
+  # It exists to be the clean target: somewhere to take a backup without touching the node
+  # answering queries, and a node to promote in a rehearsal while standby1 keeps serving reads.
+  # Deliberately not in the read path, which also makes the application's LSN comparison
+  # deterministic - one replica, one position to be ahead of.
+  standby2:
+    image: postgres:18
+    depends_on:
+      primary-init:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/standby-entrypoint.sh"]
+    command: ["postgres"]
+    environment:
+      PRIMARY_HOST: postgres
+      REPLICATION_SLOT: standby2
+      PGPASSWORD: ${REPLICATION_PASSWORD}
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - standby2data:/var/lib/postgresql/data
+      - ./docker/replication/standby-entrypoint.sh:/usr/local/bin/standby-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USERNAME} -d ${DATABASE_NAME}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    depends_on:
+      standby1:
+        condition: service_healthy
+    environment:
+      # Absence is the switch. With this unset the application declares no routing DataSource at
+      # all, Boot autoconfigures its usual single one, and not one class in shared/persistence
+      # exists - which is the path a fresh clone and the whole test suite take. Setting it turns
+      # on read routing guarded by each caller's own write position: a read-only transaction goes
+      # to the replica only when the replica has replayed past the writes that caller made, and
+      # to the primary otherwise.
+      APP_DATASOURCE_REPLICA_URL: jdbc:postgresql://standby1:5432/${DATABASE_NAME}
+
+volumes:
+  standby1data:
+  standby2data:
