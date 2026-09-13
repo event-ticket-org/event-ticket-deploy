@@ -13,29 +13,6 @@
 name: event-ticket
 
 services:
-  postgres:
-    image: postgres:18
-    environment:
-      POSTGRES_DB: ${DATABASE_NAME}
-      POSTGRES_USER: ${DATABASE_USERNAME}
-      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
-      # Pinned rather than left to the image. Postgres 18 moved the default data directory
-      # and declares VOLUME /var/lib/postgresql, so a compose file written for 17 keeps
-      # working and quietly stops persisting - the named volume mounts somewhere the server
-      # never writes and the real cluster lands in an anonymous one.
-      PGDATA: /var/lib/postgresql/data
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    # No published port. Nothing outside this network has any business reaching the database,
-    # and leaving 5432 open is also what would collide with the development stack.
-    healthcheck:
-      # -d as well as -U: pg_isready answers "accepting connections" for a server with no such
-      # role and no such database.
-      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USERNAME} -d ${DATABASE_NAME}"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   # Object storage for cover images (ADR-0006).
   #
   # SeaweedFS rather than MinIO: the MinIO community edition was archived in April 2026 and its
@@ -119,12 +96,21 @@ services:
   backend:
     image: ${BACKEND_IMAGE}
     depends_on:
-      postgres:
-        condition: service_healthy
       seaweedfs-init:
         condition: service_completed_successfully
+    # The database is not a container, so there is nothing here to wait for. It is a cluster on
+    # the host under systemd, started before Docker and outliving every `compose down`.
+    #
+    # host.docker.internal resolves to the docker0 address rather than this network's gateway,
+    # which is what the cluster's listen_addresses names. Reaching it needs three things to
+    # agree - listen_addresses, pg_hba, and the host firewall - and the firewall is the one that
+    # fails silently, because ufw drops rather than refuses and the symptom is a connection
+    # timeout that reads like the server being down. host/install-postgres.sh sets the first two
+    # and prints the ufw rule for the third.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      DATABASE_URL: jdbc:postgresql://postgres:5432/${DATABASE_NAME}
+      DATABASE_URL: jdbc:postgresql://${DATABASE_HOST}:${DATABASE_PORT}/${DATABASE_NAME}
       DATABASE_USERNAME: ${DATABASE_USERNAME}
       DATABASE_PASSWORD: ${DATABASE_PASSWORD}
 
@@ -185,5 +171,4 @@ services:
       retries: 10
 
 volumes:
-  pgdata:
   seaweeddata:
