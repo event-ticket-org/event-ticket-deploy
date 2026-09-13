@@ -17,6 +17,37 @@ open http://localhost:8081
 `FRONTEND_REPO`, or skip it entirely and set `BACKEND_IMAGE` / `FRONTEND_IMAGE` in `.env` to
 images from a registry — `compose.yaml` only ever refers to tags.
 
+## Read replicas, optional
+
+```bash
+docker compose -f compose.yaml -f compose.replicated.yaml up -d
+```
+
+Two streaming standbys, and the application routing read-only transactions to one of them. The
+base stack is unchanged and still single-node; this is an overlay over the same primary, not a
+second cluster, so there is nothing to migrate between the two shapes.
+
+It needs `REPLICATION_PASSWORD` in `.env`, and nothing else. `primary-init` prepares the primary
+on every `up` and is idempotent: it creates the `replicator` role, adds the one `pg_hba` rule the
+image omits for anything but loopback, and bounds `max_slot_wal_keep_size`. **The primary is
+never restarted** — PostgreSQL 18 enables data checksums at initdb, which gives `pg_rewind` what
+`wal_log_hints` would have, and every other setting is adequate by default.
+
+**On one machine this does not buy availability.** Three containers here share a disk, a kernel
+and a power supply. Postgres also promotes nothing by itself, which was measured rather than
+assumed: kill the primary and both standbys sit there reporting healthy and serving reads until
+a human runs `pg_promote()`. What it buys is read capacity, a backup target off the node serving
+traffic, and somewhere to rehearse a failover before performing one for real.
+
+Replication is **asynchronous**, deliberately. Synchronous commit with no standby left freezes
+every write on the primary indefinitely while `pg_isready` still answers healthy — the worst of
+the failures catalogued in event-ticket-backend's `docs/replication/01-what-went-wrong.md`, and
+not one to hand a live site by default.
+
+`APP_DATASOURCE_REPLICA_URL` is what turns routing on in the application. Absent — which is the
+base stack, a fresh clone and the whole test suite — no routing datasource is declared at all and
+the application behaves exactly as it did before replicas existed.
+
 ## What this is not
 
 It is not the development stack. `event-ticket-backend/compose.yaml` starts the two things a
