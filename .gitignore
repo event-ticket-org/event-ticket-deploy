@@ -1,2 +1,6 @@
 # Real values, never committed. env.example is the readable copy.
-.env
+#
+# The glob, not just `.env`: a deployment ends up with `.env.staging` or `.env.smoke` sooner or
+# later, and the one that is not matched is the one that gets committed. `env.example` has no
+# leading dot and is unaffected.
+.env*
