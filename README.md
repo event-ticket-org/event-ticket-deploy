@@ -59,6 +59,24 @@ sudo host/create-standby.sh standby2 5435
 docker compose -f compose.yaml -f compose.replicated.yaml up -d
 ```
 
+The overlay adds an HAProxy container and points **both** of the application's database addresses
+at it — `:5000` for writes, `:5001` for replica reads.
+
+**Neither is a hostname.** HAProxy asks every node `pg_is_in_recovery()` and routes on the
+answer, because after a promotion the names are wrong and nothing renames them: the cluster
+called `standby1` becomes the one accepting writes while the one called `eventticket` is the one
+in recovery. `option pgsql-check` cannot express this — it opens a connection and sends a startup
+packet, which proves a server is alive and says nothing about whether it accepts writes. So the
+image carries `psql` and an `external-check` script.
+
+`on-marked-down shutdown-sessions` is what makes the check mean anything. Without it HAProxy
+stops sending *new* connections to a failed node and leaves established ones alone — and HikariCP
+holds connections open for minutes, so the pool would go on writing to a node the check had
+already condemned.
+
+**It follows a promotion; it does not perform one.** Nothing here elects anything, and Postgres
+has no election. Patroni is what closes that gap, and its absence is deliberate.
+
 Standbys are **further clusters on this host**, not containers — `pg_createcluster` plus
 `pg_basebackup`, each with its own data directory, port, configuration tree and systemd unit.
 That is what Debian's packaging is for, and it keeps the standbys in the same place as the

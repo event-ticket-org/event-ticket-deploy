@@ -1,40 +1,77 @@
-# Read routing: send read-only transactions to a standby.
+# The replicated shape: read routing, and a proxy that finds the primary by asking.
 #
 #   docker compose -f compose.yaml -f compose.replicated.yaml up -d
 #
-# The standbys are clusters on this host, not services here - host/create-standby.sh builds them.
-# All this overlay does is tell the application one of them exists, which is the whole of the
-# deployment-side change.
+# The database nodes are clusters on this host - host/create-standby.sh builds the standbys. What
+# this overlay adds is the proxy in front of them and the two addresses the application uses.
 #
-# ── Why this is an overlay and not a line in compose.yaml ─────────────────────
+# ── Why a proxy at all ───────────────────────────────────────────────────────
 #
-# Absence is the switch, and it has to be true absence. The application declares its routing
-# DataSource with @ConditionalOnProperty("app.datasource.replica.url"), and Spring treats a
-# property that is present-but-empty as present - so `APP_DATASOURCE_REPLICA_URL: ${VAR:-}` in
-# compose.yaml would turn the feature on with an empty URL for every deployment that never set
-# it, and the failure would be a connection pool that cannot start.
+# Without it the application names a node. That is correct until a promotion, and wrong from the
+# instant of one - and a promotion is manual here, so it happens at the worst possible time.
+# Postgres renames nothing: after a failover the cluster called standby1 is the one accepting
+# writes and the one called eventticket is the one in recovery.
 #
-# With the variable genuinely absent, no routing DataSource is declared, Boot autoconfigures its
-# usual single one, and not one class in shared/persistence exists.
+# So neither address below is a hostname. HAProxy asks every node pg_is_in_recovery() and routes
+# on the answer:
 #
-# ── What routing actually does ───────────────────────────────────────────────
+#   :5000  the node answering false   -> writes
+#   :5001  the node answering true    -> replica reads
 #
-#   not read-only                     -> primary
-#   read-only, you wrote recently     -> primary, until the standby has replayed your write
-#   read-only, no recent write by you -> standby
+# `option pgsql-check` cannot express this. It opens a connection and sends a startup packet,
+# which proves a server is alive and says nothing about whether it accepts writes - so the image
+# carries psql and an external-check script instead.
 #
-# The guard is each caller's own last write position, compared against what the standby has
-# replayed - so @Transactional(readOnly = true) is sufficient and safe on its own, and a new read
-# endpoint inherits the guarantee without its author knowing any of this is here. The alternative
-# was classifying eighteen read-only use cases by hand, which has to be re-made by every future
-# developer.
+# ── What this still does not do ──────────────────────────────────────────────
 #
-# standby2 is deliberately not in the read path. It is the clean target - somewhere to take a
-# backup without touching the node answering queries, and a node to promote in a rehearsal while
-# standby1 keeps serving. One replica also makes the LSN comparison deterministic: one position
-# to be ahead of, rather than a choice of two.
+# It follows a promotion; it does not perform one. Nothing here elects anything, and PostgreSQL
+# has no election: kill the primary and both standbys sit there reporting healthy and serving
+# reads until a human runs pg_promote(). Patroni is the thing that closes that gap, and its
+# absence is deliberate rather than overlooked.
 
 services:
-  backend:
+  pg-haproxy:
+    build:
+      context: ./docker/haproxy
+    # The nodes are on the host, not in this network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      APP_DATASOURCE_REPLICA_URL: jdbc:postgresql://${DATABASE_HOST}:${REPLICA_PORT:-5434}/${DATABASE_NAME}
+      # Read by the entrypoint, which writes them to a file - the health check runs with a
+      # sanitised environment and would never see them otherwise.
+      DATABASE_USERNAME: ${DATABASE_USERNAME}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+    volumes:
+      - ./docker/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    # Not published. Only the backend has any business reaching it, and it does so over this
+    # network - publishing it would put an unauthenticated route to the database on the host.
+    healthcheck:
+      # Through the proxy rather than at it. A listener that is bound proves nothing: the whole
+      # question is whether any node currently passes the check behind it, and a psql that
+      # returns a row is the only thing that answers it.
+      test: ["CMD-SHELL", "PGPASSFILE=/etc/haproxy/pgpass PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 5000 -U $${DATABASE_USERNAME} -d postgres -qtAc 'select 1' | grep -q 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    depends_on:
+      pg-haproxy:
+        condition: service_healthy
+    environment:
+      # Both addresses now go through the proxy. The write address changes as well as the read
+      # one - a proxy that only fronted the replica would leave the half that matters most still
+      # naming a node.
+      DATABASE_URL: jdbc:postgresql://pg-haproxy:5000/${DATABASE_NAME}
+      # Absence is the switch, and it has to be true absence - which is why this lives here and
+      # not in compose.yaml. The application declares its routing DataSource with
+      # @ConditionalOnProperty("app.datasource.replica.url"), and Spring counts a
+      # present-but-empty property as present: `${VAR:-}` in the base file would switch the
+      # feature on with an empty URL for every deployment that never set it.
+      #
+      # What it turns on: a read-only transaction goes to the replica only when the replica has
+      # replayed past the writes that same caller made, and to the primary otherwise. So
+      # @Transactional(readOnly = true) is sufficient and safe on its own, and a new read
+      # endpoint inherits the guarantee without its author knowing any of this is here.
+      APP_DATASOURCE_REPLICA_URL: jdbc:postgresql://pg-haproxy:5001/${DATABASE_NAME}
