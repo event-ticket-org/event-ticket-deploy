@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the Postgres cluster every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Without this a laptop-style suspend would skip checks silently.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
