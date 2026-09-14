@@ -113,6 +113,46 @@ and the standbys sit there reporting healthy and serving reads until a human run
 What it buys is read capacity, a backup target off the node serving traffic, and somewhere to
 rehearse a failover before performing one for real.
 
+## Backups
+
+`backup.sh` runs nightly under `event-ticket-backup.timer`: it dumps the database, mirrors the
+cover bucket, copies `.env` and the tunnel config, **and then restores its own dump into a
+scratch database and compares row counts against live**. A dump that exists is not a backup; a
+dump that has been read back is. The result is written to `counts`, and nothing downstream trusts
+a backup that lacks it.
+
+`.env` is in there deliberately, and it is the part people forget. A ticket code is a random
+lookup plus a MAC under `TICKET_CODE_KEY`, and the code itself is never stored — restore the
+database without that key and every outstanding ticket is unverifiable.
+
+### Off-site — built, not yet switched on
+
+**Every copy currently lives on one logical volume.** The database at `/var/lib/postgresql` and
+its backups under `~/backups` are the same physical device, so one disk failure takes the data
+and every backup of it together. The nightly restore-check would go on passing right up to the
+moment there was nothing left to check.
+
+`offsite-sync.sh` closes that: it encrypts the newest **restore-checked** backup with
+`gpg --symmetric AES256`, decrypts it again to prove the archive opens, uploads it to any
+S3-compatible destination, and verifies the stored size matches. It ships ciphertext only,
+because the archive contains keys that can mint tickets.
+
+It needs a destination, which is the one part that cannot be written here. When you have one:
+
+```bash
+sudo host/enable-offsite.sh \
+    --endpoint https://<account>.r2.cloudflarestorage.com \
+    --bucket   event-ticket-backups \
+    --key      <access key id> \
+    --secret   <secret access key>
+```
+
+That generates the passphrase, makes you confirm it is in a password manager, wires it to run
+after each successful backup, and performs one sync immediately so it is proven rather than
+scheduled and hoped for. **The passphrase is generated at that moment on purpose** — a key that
+exists before anyone is ready to write it down is a key nobody writes down, and an encrypted
+backup whose passphrase lives only on the machine you lost is not a backup.
+
 ## What this is not
 
 It is not the development stack. `event-ticket-backend/compose.yaml` starts the two things a
