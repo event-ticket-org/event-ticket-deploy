@@ -1,0 +1,11 @@
+[Unit]
+Description=Ask the Postgres cluster what pg_isready cannot answer
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/event-ticket/event-ticket-deploy/host/cluster-health.sh
+# The output lands in the journal either way. A non-zero exit is what makes the failure visible
+# in `systemctl --failed` rather than only to someone reading logs.
+StandardOutput=journal
+StandardError=journal
