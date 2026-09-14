@@ -1,0 +1,14 @@
+[Unit]
+Description=Encrypt the newest backup and push it off this machine
+# Not ordered by a timer of its own. It is triggered by the backup succeeding, because there is
+# nothing worth shipping until one has - and a fixed schedule would happily upload yesterday's
+# copy again while tonight's failed.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=berserker
+ExecStart=/opt/event-ticket/event-ticket-deploy/host/offsite-sync.sh
+StandardOutput=journal
+StandardError=journal
