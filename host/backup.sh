@@ -135,12 +135,27 @@ du -sh "$out" | awk '{print "         size " $1}'
 # ── retention ─────────────────────────────────────────────────────────────────
 # Oldest first, keep the newest KEEP. Deliberately dumb: a clever rotation is a thing that can
 # be wrong in a way nobody notices until there is nothing left to restore.
+#
+# A prune that cannot finish does not fail the run. By this point the backup is written and has
+# been restored into a scratch database - saying "failed" then would hide a good backup behind a
+# housekeeping problem, and would train whoever reads the alert to ignore it.
+#
+# That is not hypothetical: a directory from before the cover mirror ran with --user has
+# root-owned files in it, which this user cannot remove, and one such directory failed every run
+# from then on.
 mapfile -t old < <(find "$DEST" -mindepth 1 -maxdepth 1 -type d -name '20*' | sort | head -n -"$KEEP")
+stuck=0
 for directory in "${old[@]:-}"; do
     [ -n "$directory" ] || continue
-    log "pruning $(basename "$directory")"
-    rm -rf "$directory"
+    if rm -rf "$directory" 2>/dev/null; then
+        log "pruned $(basename "$directory")"
+    else
+        stuck=$((stuck + 1))
+        log "WARNING: could not prune $(basename "$directory") - left in place"
+    fi
 done
+[ "$stuck" -eq 0 ] || log "WARNING: $stuck old backup(s) could not be removed; disk use will grow"
+
 
 log "done  ->  $out"
 ls -1 "$DEST" | tail -5 | sed 's/^/         /'
