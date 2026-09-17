@@ -24,7 +24,7 @@ if [[ ! -f .env ]]; then
     # what the file is for. A BSD sed needs the empty argument to -i and a GNU sed refuses it,
     # which is why this writes through a temporary file instead.
     for key in DATABASE_PASSWORD JWT_SECRET TICKET_CODE_KEY FAKE_PAYMENT_SECRET \
-               STORAGE_SECRET_KEY; do
+               STORAGE_SECRET_KEY SEARCH_PASSWORD; do
         value=$(secret)
         awk -v k="$key" -v v="$value" \
             'index($0, k "=") == 1 { print k "=" v; next } { print }' .env > .env.tmp

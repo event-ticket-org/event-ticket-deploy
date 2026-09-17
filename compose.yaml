@@ -93,11 +93,68 @@ services:
         echo "fs.configure -locationPrefix=/buckets/$$STORAGE_BUCKET/pending/ -ttl=1d -apply" \
           | weed shell -master=seaweedfs:9333
 
+  # ── Elasticsearch ─────────────────────────────────────────────────────────────────────────
+  #
+  # The search index, and later an ELK stack, on one cluster.
+  #
+  # Elasticsearch has no schemas and no databases - there is nothing between a cluster and an
+  # index - so two systems sharing one are separated by a naming convention and by roles, not
+  # by anything structural. The application claims `eventticket-*`; an ELK stack will claim
+  # `logs-*`, `metrics-*` and `traces-*`, and Kibana `.kibana*`.
+  #
+  # **Everything in here is derived.** Every document is rebuilt from Postgres by the nightly
+  # job, so losing this volume costs a rebuild and never data - which is why it is a container
+  # while the database is not. The volume exists to avoid re-indexing on every restart, not to
+  # keep anything.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.5
+    environment:
+      discovery.type: single-node
+      # Authentication on, TLS off, and both halves are deliberate. This is reachable on this
+      # network and on loopback only, so transport encryption between containers on one host
+      # buys nothing; basic auth is what will keep a Kibana, a beat and the application in
+      # separate roles once the cluster is shared.
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "false"
+      ELASTIC_PASSWORD: ${SEARCH_PASSWORD}
+      # Stated rather than inherited. Left alone the JVM sizes its heap from the host's total
+      # RAM, which on this machine is 23 GiB and not remotely what this should take. Half the
+      # container limit, which is the shape Elasticsearch asks for.
+      ES_JAVA_OPTS: -Xms2g -Xmx2g
+      # One node, so a replica has nowhere to go. Without this the first ELK index sits yellow
+      # forever waiting for a shard that cannot be allocated, and "yellow" stops meaning
+      # anything is wrong.
+      cluster.routing.allocation.disk.threshold_enabled: "true"
+    mem_limit: 4g
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    ports:
+      # Loopback only. Nothing outside this host needs it, and a Kibana later will run beside
+      # it rather than across a network.
+      - "127.0.0.1:${SEARCH_PORT}:9200"
+    healthcheck:
+      # Authenticated, because an unauthenticated probe answers 401 and would mark a healthy
+      # cluster unhealthy forever. Yellow counts as healthy: one node cannot be green with any
+      # replica configured, and waiting for green is waiting for something that will not happen.
+      # The "credential" the scanner sees below is the name of an environment variable, and the
+      # curl-auth-user rule cannot tell `-u user:$VAR` from `-u user:hunter2`. Allowed inline
+      # rather than by fingerprint, because a fingerprint is pinned to a commit sha and stops
+      # matching the moment the commit is amended or rebased.
+      test: ["CMD-SHELL", "curl -fsS -u elastic:$$ELASTIC_PASSWORD http://127.0.0.1:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"] # gitleaks:allow
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 30s
+
   backend:
     image: ${BACKEND_IMAGE}
     depends_on:
       seaweedfs-init:
         condition: service_completed_successfully
+      elasticsearch:
+        condition: service_healthy
     # The database is not a container, so there is nothing here to wait for. It is a cluster on
     # the host under systemd, started before Docker and outliving every `compose down`.
     #
@@ -136,10 +193,23 @@ services:
       STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY}
       STORAGE_REGION: ${STORAGE_REGION}
 
+      # The search cluster. Absent means there is no cluster and the listing serves from
+      # Postgres; present means the indexer runs and the credentials are required, so an
+      # application started without them refuses to boot rather than discovering at the first
+      # publish that it cannot index anything.
+      APP_SEARCH_URI: http://elasticsearch:9200
+      APP_SEARCH_USERNAME: elastic
+      APP_SEARCH_PASSWORD: ${SEARCH_PASSWORD}
+
       # Absent means there is no Stripe provider at all, rather than one that fails on first
       # use. Empty is the correct value for a deployment without an account.
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+    # A limit, at last, and the reason it arrives with Elasticsearch: two unbounded JVMs on one
+    # box is how you find out that both sized their heaps from the host's total RAM. This one
+    # had been sizing from 23 GiB since the first deployment, which was harmless only for as
+    # long as it was the only JVM here.
+    mem_limit: 2g
     # Not published. The browser reaches the API through the frontend's proxy on one origin,
     # which is the arrangement the client assumes - it asks for /api/v1 relative to wherever
     # it was served and never learns a backend address.
@@ -172,3 +242,6 @@ services:
 
 volumes:
   seaweeddata:
+  # Derived, and disposable. Every document is rebuilt from Postgres by the nightly job, so
+  # losing this costs a rebuild and never data. It exists to avoid re-indexing on each restart.
+  elasticsearch-data:

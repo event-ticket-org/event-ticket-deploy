@@ -20,6 +20,7 @@ open http://localhost:8081
 |---|---|---|
 | backend, frontend | **containers** | stateless. The image tag is the version; if an image is lost you rebuild it from source. |
 | PostgreSQL | **host**, systemd, its own cluster | state you cannot rebuild |
+| Elasticsearch | **container** | derived. Every document is rebuilt from Postgres nightly, so losing the volume costs a rebuild and never data - which is exactly the test the database fails and this passes. |
 | SeaweedFS | container, for now | state you cannot rebuild either — it should follow |
 
 The line is not "containers bad". It is **which things hold state that cannot be reconstructed**.
@@ -164,6 +165,34 @@ npm run dev                                       # in event-ticket-frontend
 ```
 
 The two publish some of the same ports, so run one or the other.
+
+## One cluster, two tenants
+
+Elasticsearch has no schemas and no databases. There is nothing between a cluster and an index,
+so two systems sharing one are separated by a naming convention and by roles, and by nothing
+structural at all.
+
+| prefix | who |
+|---|---|
+| `eventticket-*` | the application's search index |
+| `logs-*` `metrics-*` `traces-*` | an ELK stack, when it arrives |
+| `.kibana*` | Kibana |
+
+The application's alias is `eventticket-events`, and the concrete indexes behind it are
+`eventticket-events-<timestamp>` - replaced whole on each nightly rebuild, with the alias moved
+in one atomic call so a reader sees the old index or the new one and never a partial one.
+
+**Authentication is on and TLS is off**, and both halves are deliberate. The cluster is
+published on loopback only and is otherwise reachable on the compose network, so transport
+encryption between containers on one host buys nothing; basic auth is what keeps a Kibana, a
+beat and the application in separate roles once the cluster is shared. `elastic` is the
+built-in superuser and is what the application uses today; when ELK arrives the sensible move
+is a role per writer rather than this account handed round.
+
+**Both JVMs now have limits, and that is what Elasticsearch arriving forced.** Left alone a JVM
+sizes its heap from the host's total RAM - 23 GiB here - which was harmless for exactly as long
+as the backend was the only one. `ES_JAVA_OPTS` is half the container limit, which is the shape
+Elasticsearch asks for.
 
 ## The shape of a deployment
 
