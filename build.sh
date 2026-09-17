@@ -17,14 +17,15 @@ FRONTEND_REPO=${FRONTEND_REPO:-../event-ticket-frontend}
 # that runs Docker; base64 rather than hex so the same entropy is fewer characters.
 secret() { openssl rand -base64 36 | tr -d '\n/+=' | cut -c1-48; }
 
+SECRETS="DATABASE_PASSWORD JWT_SECRET TICKET_CODE_KEY FAKE_PAYMENT_SECRET STORAGE_SECRET_KEY SEARCH_PASSWORD"
+
 if [[ ! -f .env ]]; then
     echo "==> writing .env with generated secrets"
     cp env.example .env
     # In place, per key, so the comments in env.example survive into .env - they are most of
     # what the file is for. A BSD sed needs the empty argument to -i and a GNU sed refuses it,
     # which is why this writes through a temporary file instead.
-    for key in DATABASE_PASSWORD JWT_SECRET TICKET_CODE_KEY FAKE_PAYMENT_SECRET \
-               STORAGE_SECRET_KEY SEARCH_PASSWORD; do
+    for key in $SECRETS; do
         value=$(secret)
         awk -v k="$key" -v v="$value" \
             'index($0, k "=") == 1 { print k "=" v; next } { print }' .env > .env.tmp
@@ -32,6 +33,45 @@ if [[ ! -f .env ]]; then
     done
     echo "    .env written. It is gitignored, and PLATFORM_ADMIN_EMAILS is still empty -"
     echo "    set it to your own address before the first sign-up if you want the admin queue."
+fi
+
+# ── keys added since this .env was written ────────────────────────────────────────────────
+#
+# The block above only runs when there is no .env at all, so for the life of a deployment every
+# *new* key in env.example was invisible to it. That is not a hypothetical: the search cluster
+# added SEARCH_PORT and SEARCH_PASSWORD, and the first deploy after it would have started
+# Elasticsearch with an empty ELASTIC_PASSWORD and a backend that refuses to boot without one -
+# a failure whose cause is in a file nobody thought to look at, because it had been correct for
+# months.
+#
+# So: anything in env.example and not in .env is appended here. A secret gets a generated value
+# and everything else gets the example's own, which is right because the non-secret examples are
+# defaults rather than placeholders.
+#
+# Existing values are never touched. This only ever adds.
+missing=()
+while IFS= read -r key; do
+    grep -qE "^${key}=" .env || missing+=("$key")
+done < <(grep -oE '^[A-Z][A-Z0-9_]*=' env.example | tr -d '=')
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "==> .env is missing ${#missing[@]} key(s) added since it was written"
+    {
+        echo ""
+        echo "# Added by build.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ). See env.example for what each is."
+    } >> .env
+    for key in "${missing[@]}"; do
+        if [[ " $SECRETS " == *" $key "* ]]; then
+            printf '%s=%s\n' "$key" "$(secret)" >> .env
+            echo "    $key (generated)"
+        else
+            # The example's value, taken verbatim - `KEY=value` with everything after the first
+            # `=` kept, so a value containing one survives.
+            printf '%s=%s\n' "$key" "$(grep -m1 -E "^${key}=" env.example | cut -d= -f2-)" >> .env
+            echo "    $key (from env.example)"
+        fi
+    done
+    chmod 600 .env
 fi
 
 # shellcheck disable=SC1091
